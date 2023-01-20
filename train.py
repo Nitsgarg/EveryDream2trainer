@@ -22,9 +22,10 @@ import logging
 import time
 import gc
 import random
+import shutil
 
 import torch.nn.functional as F
-from torch.cuda.amp import autocast
+from torch.cuda.amp import autocast, GradScaler
 import torchvision.transforms as transforms
 
 from colorama import Fore, Style, Cursor
@@ -92,14 +93,14 @@ def convert_to_hf(ckpt_path):
         else:
             logging.info(f"Found cached checkpoint at {hf_cache}")
         
-        patch_unet(hf_cache, args.ed1_mode, args.lowvram)
-        return hf_cache
+        is_sd1attn, yaml = patch_unet(hf_cache)
+        return hf_cache, is_sd1attn, yaml
     elif os.path.isdir(hf_cache):
-        patch_unet(hf_cache, args.ed1_mode, args.lowvram)
-        return hf_cache
+        is_sd1attn, yaml = patch_unet(hf_cache)
+        return hf_cache, is_sd1attn, yaml
     else:
-        patch_unet(ckpt_path, args.ed1_mode, args.lowvram)
-        return ckpt_path
+        is_sd1attn, yaml = patch_unet(ckpt_path)
+        return ckpt_path, is_sd1attn, yaml
 
 def setup_local_logger(args):
     """
@@ -230,10 +231,6 @@ def setup_args(args):
         # find the last checkpoint in the logdir
         args.resume_ckpt = find_last_checkpoint(args.logdir)
 
-    if args.ed1_mode and args.mixed_precision == "fp32" and not args.disable_xformers:
-        args.disable_xformers = True
-        logging.info("   ED1 mode: Overiding disable_xformers to True")
-
     if args.lowvram:
         set_args_12gb(args)
 
@@ -272,15 +269,34 @@ def setup_args(args):
     if args.save_ckpt_dir is not None and not os.path.exists(args.save_ckpt_dir):
         os.makedirs(args.save_ckpt_dir)
 
-    if args.mixed_precision != "fp32" and (args.clip_grad_norm is None or args.clip_grad_norm <= 0):
-        args.clip_grad_norm = 1.0
-
     if args.rated_dataset:
         args.rated_dataset_target_dropout_percent = min(max(args.rated_dataset_target_dropout_percent, 0), 100)
 
         logging.info(logging.info(f"{Fore.CYAN} * Activating rated images learning with a target rate of {args.rated_dataset_target_dropout_percent}% {Style.RESET_ALL}"))
 
     return args
+
+def update_grad_scaler(scaler: GradScaler, global_step, epoch, step):
+    if global_step == 250 or (epoch >= 2 and step == 1):
+        factor = 1.8
+        scaler.set_growth_factor(factor)
+        scaler.set_backoff_factor(1/factor)
+        scaler.set_growth_interval(50)
+    if global_step == 500 or (epoch >= 4 and step == 1):
+        factor = 1.6
+        scaler.set_growth_factor(factor)
+        scaler.set_backoff_factor(1/factor)
+        scaler.set_growth_interval(50)
+    if global_step == 1000 or (epoch >= 8 and step == 1):
+        factor = 1.3
+        scaler.set_growth_factor(factor)
+        scaler.set_backoff_factor(1/factor)
+        scaler.set_growth_interval(100)
+    if global_step == 3000 or (epoch >= 15 and step == 1):
+        factor = 1.15
+        scaler.set_growth_factor(factor)
+        scaler.set_backoff_factor(1/factor)
+        scaler.set_growth_interval(100)
 
 def main(args):
     """
@@ -303,12 +319,12 @@ def main(args):
     torch.backends.cudnn.benchmark = True
 
     log_folder = os.path.join(args.logdir, f"{args.project_name}_{log_time}")
-    logging.info(f"Logging to {log_folder}")
+
     if not os.path.exists(log_folder):
         os.makedirs(log_folder)
 
     @torch.no_grad()
-    def __save_model(save_path, unet, text_encoder, tokenizer, scheduler, vae, save_ckpt_dir, save_full_precision=False):
+    def __save_model(save_path, unet, text_encoder, tokenizer, scheduler, vae, save_ckpt_dir, yaml_name, save_full_precision=False):
         """
         Save the model to disk
         """
@@ -329,6 +345,7 @@ def main(args):
         )
         pipeline.save_pretrained(save_path)
         sd_ckpt_path = f"{os.path.basename(save_path)}.ckpt"
+        
         if save_ckpt_dir is not None:
             sd_ckpt_full = os.path.join(save_ckpt_dir, sd_ckpt_path)
         else:
@@ -338,8 +355,13 @@ def main(args):
 
         logging.info(f" * Saving SD model to {sd_ckpt_full}")
         converter(model_path=save_path, checkpoint_path=sd_ckpt_full, half=half)
-        # optimizer_path = os.path.join(save_path, "optimizer.pt")
 
+        if yaml:
+            yaml_save_path = f"{os.path.basename(save_path)}.yaml"
+            logging.info(f" * Saving yaml to {yaml_save_path}")
+            shutil.copyfile(yaml, yaml_save_path)
+
+        # optimizer_path = os.path.join(save_path, "optimizer.pt")
         # if self.save_optimizer_flag:
         #     logging.info(f" Saving optimizer state to {save_path}")
         #     self.save_optimizer(self.ctx.optimizer, optimizer_path)
@@ -401,7 +423,7 @@ def main(args):
         """
         logging.info(f"Generating samples gs:{gs}, for {prompts}")
         seed = args.seed if args.seed != -1 else random.randint(0, 2**30)
-        gen = torch.Generator(device="cuda").manual_seed(seed)
+        gen = torch.Generator(device=device).manual_seed(seed)
 
         i = 0
         for prompt in prompts:
@@ -445,24 +467,22 @@ def main(args):
             del images
 
     try: 
-        hf_ckpt_path = convert_to_hf(args.resume_ckpt)
+        hf_ckpt_path, is_sd1attn, yaml = convert_to_hf(args.resume_ckpt)
         text_encoder = CLIPTextModel.from_pretrained(hf_ckpt_path, subfolder="text_encoder")
         vae = AutoencoderKL.from_pretrained(hf_ckpt_path, subfolder="vae")
-        unet = UNet2DConditionModel.from_pretrained(hf_ckpt_path, subfolder="unet", upcast_attention=not args.ed1_mode)
+        unet = UNet2DConditionModel.from_pretrained(hf_ckpt_path, subfolder="unet", upcast_attention=not is_sd1attn)
         sample_scheduler = DDIMScheduler.from_pretrained(hf_ckpt_path, subfolder="scheduler")
         noise_scheduler = DDPMScheduler.from_pretrained(hf_ckpt_path, subfolder="scheduler")
         tokenizer = CLIPTokenizer.from_pretrained(hf_ckpt_path, subfolder="tokenizer", use_fast=False)
+        logging.info(f" Inferred yaml: {yaml}, attention head type: {'sd1' if is_sd1attn else 'sd2'}")
     except:
         logging.ERROR(" * Failed to load checkpoint *")
 
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
         text_encoder.gradient_checkpointing_enable()
-
-    if args.ed1_mode and not args.lowvram:
-        unet.set_attention_slice(4)
     
-    if not args.disable_xformers and is_xformers_available():
+    if not args.disable_xformers and (args.amp and is_sd1attn) or (not is_sd1attn):
         try:
             unet.enable_xformers_memory_efficient_attention()
             logging.info("Enabled xformers")
@@ -475,22 +495,13 @@ def main(args):
     default_lr = 2e-6
     curr_lr = args.lr if args.lr is not None else default_lr
 
-    d_type = torch.float32
-    if args.mixed_precision == "fp16":
-        d_type = torch.float16
-        logging.info(" * Using fp16 *")
-        args.amp = True
-    elif args.mixed_precision == "bf16":
-        d_type = torch.bfloat16
-        logging.info(" * Using bf16 *")
-        args.amp = True
+
+    vae = vae.to(device, dtype=torch.float16 if args.amp else torch.float32)
+    unet = unet.to(device, dtype=torch.float32)
+    if args.disable_textenc_training and args.amp:
+        text_encoder = text_encoder.to(device, dtype=torch.float16)
     else:
-        logging.info(" * Using FP32 *")
-
-
-    vae = vae.to(device, dtype=torch.float16 if (args.amp and d_type == torch.float32) else d_type)
-    unet = unet.to(device, dtype=d_type)
-    text_encoder = text_encoder.to(device, dtype=d_type)
+        text_encoder = text_encoder.to(device, dtype=torch.float32)
 
     if args.disable_textenc_training:
         logging.info(f"{Fore.CYAN} * NOT Training Text Encoder, quality reduced *{Style.RESET_ALL}")
@@ -504,8 +515,8 @@ def main(args):
 
     betas = (0.9, 0.999)
     epsilon = 1e-8
-    if args.amp or args.mix_precision == "fp16":
-        epsilon = 1e-8
+    if args.amp:
+        epsilon = 2e-8
     
     weight_decay = 0.01
     if args.useadam8bit:
@@ -581,7 +592,6 @@ def main(args):
     
     log_args(log_writer, args)
 
-    
 
     """
     Train the model
@@ -666,17 +676,17 @@ def main(args):
     logging.info(f" {Fore.GREEN}batch_size: {Style.RESET_ALL}{Fore.LIGHTGREEN_EX}{args.batch_size}{Style.RESET_ALL}")
     logging.info(f" {Fore.GREEN}epoch_len: {Fore.LIGHTGREEN_EX}{epoch_len}{Style.RESET_ALL}")
 
-    if args.amp or d_type != torch.float32:
-        #scaler = torch.cuda.amp.GradScaler()
-        scaler = torch.cuda.amp.GradScaler(
-            enabled=False,
-            #enabled=True,
-            init_scale=2048.0,
-            growth_factor=1.5,
-            backoff_factor=0.707,
-            growth_interval=50,
-        )
-        logging.info(f" Grad scaler enabled: {scaler.is_enabled()}")
+
+    #scaler = torch.cuda.amp.GradScaler()
+    scaler = GradScaler(
+        enabled=args.amp,
+        init_scale=2**17.5,
+        growth_factor=2,
+        backoff_factor=1.0/2,
+        growth_interval=25,
+    )
+    logging.info(f" Grad scaler enabled: {scaler.is_enabled()} (amp mode)")
+
 
     epoch_pbar = tqdm(range(args.max_epochs), position=0, leave=True)
     epoch_pbar.set_description(f"{Fore.LIGHTCYAN_EX}Epochs{Style.RESET_ALL}")
@@ -741,7 +751,7 @@ def main(args):
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
                 del noise, latents, cuda_caption
 
-                with autocast(enabled=args.amp or d_type != torch.float32):
+                with autocast(enabled=args.amp):
                     model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
                 del timesteps, encoder_hidden_states, noisy_latents
@@ -750,10 +760,10 @@ def main(args):
 
                 del target, model_pred
 
-                if args.amp:
-                    scaler.scale(loss).backward()
-                else:
-                    loss.backward()
+                #if args.amp:
+                scaler.scale(loss).backward()
+                #else:
+                #    loss.backward()
 
                 if args.clip_grad_norm is not None:
                     if not args.disable_unet_training:
@@ -773,11 +783,11 @@ def main(args):
                                     param.grad *= grad_scale
 
                 if ((global_step + 1) % args.grad_accum == 0) or (step == epoch_len - 1):
-                    if args.amp and d_type == torch.float32:
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        optimizer.step()
+                    # if args.amp:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    # else:
+                    #     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
 
                 lr_scheduler.step()
@@ -831,19 +841,20 @@ def main(args):
                     last_epoch_saved_time = time.time()
                     logging.info(f"Saving model, {args.ckpt_every_n_minutes} mins at step {global_step}")
                     save_path = os.path.join(f"{log_folder}/ckpts/{args.project_name}-ep{epoch:02}-gs{global_step:05}")
-                    __save_model(save_path, unet, text_encoder, tokenizer, noise_scheduler, vae, args.save_ckpt_dir, args.save_full_precision)
+                    __save_model(save_path, unet, text_encoder, tokenizer, noise_scheduler, vae, args.save_ckpt_dir, yaml, args.save_full_precision)
 
                 if epoch > 0 and epoch % args.save_every_n_epochs == 0 and step == 1 and epoch < args.max_epochs - 1:
                     logging.info(f" Saving model, {args.save_every_n_epochs} epochs at step {global_step}")
                     save_path = os.path.join(f"{log_folder}/ckpts/{args.project_name}-ep{epoch:02}-gs{global_step:05}")
-                    __save_model(save_path, unet, text_encoder, tokenizer, noise_scheduler, vae, args.save_ckpt_dir, args.save_full_precision)
+                    __save_model(save_path, unet, text_encoder, tokenizer, noise_scheduler, vae, args.save_ckpt_dir, yaml, args.save_full_precision)
 
                 del batch
                 global_step += 1
+                update_grad_scaler(scaler, global_step, epoch, step) if args.amp else None
                 # end of step
 
             steps_pbar.close()
-            
+
             elapsed_epoch_time = (time.time() - epoch_start_time) / 60
             epoch_times.append(dict(epoch=epoch, time=elapsed_epoch_time))
             log_writer.add_scalar("performance/minutes per epoch", elapsed_epoch_time, global_step)
@@ -851,7 +862,7 @@ def main(args):
             epoch_pbar.update(1)
             if epoch < args.max_epochs - 1:
                 train_batch.shuffle(epoch_n=epoch, max_epochs = args.max_epochs)
-            
+
             loss_local = sum(loss_epoch) / len(loss_epoch)
             log_writer.add_scalar(tag="loss/epoch", scalar_value=loss_local, global_step=global_step)
             # end of epoch
@@ -859,7 +870,7 @@ def main(args):
         # end of training
 
         save_path = os.path.join(f"{log_folder}/ckpts/last-{args.project_name}-ep{epoch:02}-gs{global_step:05}")
-        __save_model(save_path, unet, text_encoder, tokenizer, noise_scheduler, vae, args.save_ckpt_dir, args.save_full_precision)
+        __save_model(save_path, unet, text_encoder, tokenizer, noise_scheduler, vae, args.save_ckpt_dir, yaml, args.save_full_precision)
 
         total_elapsed_time = time.time() - training_start_time
         logging.info(f"{Fore.CYAN}Training complete{Style.RESET_ALL}")
@@ -869,7 +880,7 @@ def main(args):
     except Exception as ex:
         logging.error(f"{Fore.LIGHTYELLOW_EX}Something went wrong, attempting to save model{Style.RESET_ALL}")
         save_path = os.path.join(f"{log_folder}/ckpts/errored-{args.project_name}-ep{epoch:02}-gs{global_step:05}")
-        __save_model(save_path, unet, text_encoder, tokenizer, noise_scheduler, vae, args.save_ckpt_dir, args.save_full_precision)
+        __save_model(save_path, unet, text_encoder, tokenizer, noise_scheduler, vae, args.save_ckpt_dir, yaml, args.save_full_precision)
         raise ex
 
     logging.info(f"{Fore.LIGHTWHITE_EX} ***************************{Style.RESET_ALL}")
@@ -893,9 +904,6 @@ def update_old_args(t_args):
     if not hasattr(t_args, "disable_unet_training"):
         print(f" Config json is missing 'disable_unet_training' flag")
         t_args.__dict__["disable_unet_training"] = False
-    if not hasattr(t_args, "mixed_precision"):
-        print(f" Config json is missing 'mixed_precision' flag")
-        t_args.__dict__["mixed_precision"] = "fp32"
     if not hasattr(t_args, "rated_dataset"):
         print(f" Config json is missing 'rated_dataset' flag")
         t_args.__dict__["rated_dataset"] = False
@@ -916,15 +924,13 @@ if __name__ == "__main__":
         with open(args.config, 'rt') as f:
             t_args = argparse.Namespace()
             t_args.__dict__.update(json.load(f))
-            print(t_args.__dict__)
             update_old_args(t_args) # update args to support older configs
-            print(t_args.__dict__)
+            print(f" args: \n{t_args.__dict__}")
             args = argparser.parse_args(namespace=t_args)
-            print(f"mixed_precision: {args.mixed_precision}")
     else:
         print("No config file specified, using command line args")
         argparser = argparse.ArgumentParser(description="EveryDream2 Training options")
-        argparser.add_argument("--amp", action="store_true", default=False, help="use floating point 16 bit training, experimental, reduces quality")
+        argparser.add_argument("--amp", action="store_true", default=False, help="Enables automatic mixed precision compute, recommended on")
         argparser.add_argument("--batch_size", type=int, default=2, help="Batch size (def: 2)")
         argparser.add_argument("--ckpt_every_n_minutes", type=int, default=None, help="Save checkpoint every n minutes, def: 20")
         argparser.add_argument("--clip_grad_norm", type=float, default=None, help="Clip gradient norm (def: disabled) (ex: 1.5), useful if loss=nan?")
@@ -935,7 +941,6 @@ if __name__ == "__main__":
         argparser.add_argument("--disable_unet_training", action="store_true", default=False, help="disables training of unet (def: False) NOT RECOMMENDED")
         argparser.add_argument("--disable_xformers", action="store_true", default=False, help="disable xformers, may reduce performance (def: False)")
         argparser.add_argument("--flip_p", type=float, default=0.0, help="probability of flipping image horizontally (def: 0.0) use 0.0 to 1.0, ex 0.5, not good for specific faces!")
-        argparser.add_argument("--ed1_mode", action="store_true", default=False, help="Disables xformers and reduces attention heads to 8 (SD1.x style)")
         argparser.add_argument("--gpuid", type=int, default=0, help="id of gpu to use for training, (def: 0) (ex: 1 to use GPU_ID 1)")
         argparser.add_argument("--gradient_checkpointing", action="store_true", default=False, help="enable gradient checkpointing to reduce VRAM use, may reduce performance (def: False)")
         argparser.add_argument("--grad_accum", type=int, default=1, help="Gradient accumulation factor (def: 1), (ex, 2)")
@@ -947,7 +952,6 @@ if __name__ == "__main__":
         argparser.add_argument("--lr_scheduler", type=str, default="constant", help="LR scheduler, (default: constant)", choices=["constant", "linear", "cosine", "polynomial"])
         argparser.add_argument("--lr_warmup_steps", type=int, default=None, help="Steps to reach max LR during warmup (def: 0.02 of lr_decay_steps), non-functional for constant")
         argparser.add_argument("--max_epochs", type=int, default=300, help="Maximum number of epochs to train for")
-        argparser.add_argument("--mixed_precision", type=str, default='fp32', help="precision for the model training", choices=supported_precisions)
         argparser.add_argument("--notebook", action="store_true", default=False, help="disable keypresses and uses tqdm.notebook for jupyter notebook (def: False)")
         argparser.add_argument("--project_name", type=str, default="myproj", help="Project name for logs and checkpoints, ex. 'tedbennett', 'superduperV1'")
         argparser.add_argument("--resolution", type=int, default=512, help="resolution to train", choices=supported_resolutions)
@@ -967,6 +971,6 @@ if __name__ == "__main__":
         argparser.add_argument("--rated_dataset", action="store_true", default=False, help="enable rated image set training, to less often train on lower rated images through the epochs")
         argparser.add_argument("--rated_dataset_target_dropout_percent", type=int, default=50, help="how many images (in percent) should be included in the last epoch (Default 50)")
 
-        args = argparser.parse_args()
+        args, _ = argparser.parse_known_args()
 
     main(args)
